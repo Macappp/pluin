@@ -65,7 +65,7 @@ app.post('/convert', upload.single('file'), async (req, res) => {
         // Enable console logging from the page
         page.on('console', msg => console.log('PAGE:', msg.text()));
 
-        // Variables to track Photopea state
+        // Variables to track Photopea state (in Node.js scope)
         let photopeaReady = false;
         let fileLoaded = false;
         let psdData = null;
@@ -86,6 +86,33 @@ app.post('/convert', upload.single('file'), async (req, res) => {
             psdData = Buffer.from(dataArray);
         });
 
+        // CRITICAL: Attach listeners BEFORE navigation using evaluateOnNewDocument
+        // This ensures we don't miss the initial "done" message
+        await page.evaluateOnNewDocument(() => {
+            let readyReceived = false;
+            let fileSent = false;
+
+            window.addEventListener('message', function (e) {
+                if (e.data === 'done') {
+                    if (!readyReceived) {
+                        readyReceived = true;
+                        console.log('[Browser] Photopea initial done');
+                        window.__ppReady();
+                    } else if (fileSent) {
+                        console.log('[Browser] Photopea script/file processing done');
+                        window.__ppFileLoaded();
+                    }
+                } else if (e.data instanceof ArrayBuffer) {
+                    console.log('[Browser] Received ArrayBuffer: ' + e.data.byteLength);
+                    const arr = Array.from(new Uint8Array(e.data));
+                    window.__ppPsdData(arr);
+                }
+            });
+
+            // Help track when we've sent a file/script
+            window.markFileSent = () => { fileSent = true; };
+        });
+
         // Navigate to Photopea
         console.log('🌐 Loading Photopea...');
         await page.goto('https://www.photopea.com/', {
@@ -93,37 +120,8 @@ app.post('/convert', upload.single('file'), async (req, res) => {
             timeout: 90000
         });
 
-        // Set up message listener in page context to forward to our exposed functions
-        console.log('⏳ Setting up message handlers...');
-        await page.evaluate(() => {
-            let readyReceived = false;
-            let fileLoadedReceived = false;
-
-            window.addEventListener('message', async function (e) {
-                if (e.data === 'done') {
-                    if (!readyReceived) {
-                        readyReceived = true;
-                        console.log('Photopea sent initial done');
-                        window.__ppReady();
-                    } else if (!fileLoadedReceived) {
-                        fileLoadedReceived = true;
-                        console.log('Photopea sent file loaded done');
-                        window.__ppFileLoaded();
-                    } else {
-                        console.log('Photopea sent additional done (after export)');
-                    }
-                } else if (e.data instanceof ArrayBuffer) {
-                    console.log('Received ArrayBuffer: ' + e.data.byteLength + ' bytes');
-                    const arr = Array.from(new Uint8Array(e.data));
-                    window.__ppPsdData(arr);
-                } else if (typeof e.data === 'string') {
-                    console.log('Photopea string message: ' + e.data.substring(0, 100));
-                }
-            });
-        });
-
         // Wait for Photopea to be ready
-        console.log('⏳ Waiting for Photopea to initialize...');
+        console.log('⏳ Waiting for Photopea to initialize (expecting "done")...');
         await waitFor(() => photopeaReady, 60000, 'Photopea initialization');
         console.log('✅ Photopea is ready');
 
@@ -131,15 +129,16 @@ app.post('/convert', upload.single('file'), async (req, res) => {
         console.log('📤 Sending .fig file to Photopea...');
         await page.evaluate((bufferArray) => {
             const uint8Array = new Uint8Array(bufferArray);
+            window.markFileSent();
             window.postMessage(uint8Array.buffer, '*');
         }, Array.from(fileBuffer));
 
         // Wait for file to be loaded
-        console.log('⏳ Waiting for file to load...');
-        await waitFor(() => fileLoaded, 60000, 'File loading');
+        console.log('⏳ Waiting for Photopea to process file...');
+        await waitFor(() => fileLoaded, 60000, 'File processing');
         console.log('✅ File loaded in Photopea');
 
-        // Small delay for rendering
+        // Small delay for rendering safety
         await new Promise(r => setTimeout(r, 2000));
 
         // Request PSD export
