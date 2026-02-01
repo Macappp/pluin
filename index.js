@@ -46,7 +46,6 @@ app.post('/convert', upload.single('file'), async (req, res) => {
 
     let browser;
     try {
-        // Launch headless browser with Puppeteer
         console.log('🚀 Launching Puppeteer...');
         browser = await puppeteer.launch({
             headless: 'new',
@@ -61,146 +60,111 @@ app.post('/convert', upload.single('file'), async (req, res) => {
         });
 
         const page = await browser.newPage();
+        page.setDefaultTimeout(120000);
 
-        // Listen for console logs from the browser
-        page.on('console', msg => console.log('PAGE LOG:', msg.text()));
+        // Enable console logging from the page
+        page.on('console', msg => console.log('PAGE:', msg.text()));
 
-        // Create a wrapper HTML page with Photopea in an iframe
-        // This is REQUIRED because Photopea's postMessage API is designed
-        // for communication between parent window and iframe
-        const wrapperHTML = `
-        <!DOCTYPE html>
-        <html>
-        <head><title>Photopea Wrapper</title></head>
-        <body style="margin:0;padding:0;overflow:hidden;">
-            <iframe id="pp" src="https://www.photopea.com/" 
-                    style="width:100%;height:100vh;border:none;"></iframe>
-            <script>
-                window.ppReady = false;
-                window.psdData = null;
-                window.ppError = null;
-                window.messageLog = [];
-                
-                window.addEventListener('message', function(e) {
-                    // Messages from Photopea iframe
-                    if (e.data === 'done') {
-                        console.log('Photopea: done signal received');
-                        window.ppReady = true;
-                        window.messageLog.push('done');
-                    } else if (e.data instanceof ArrayBuffer) {
-                        console.log('Photopea: ArrayBuffer received, size=' + e.data.byteLength);
-                        window.psdData = e.data;
-                        window.messageLog.push('arraybuffer:' + e.data.byteLength);
-                    } else if (typeof e.data === 'string') {
-                        console.log('Photopea message: ' + e.data);
-                        window.messageLog.push('string:' + e.data.substring(0, 50));
+        // Variables to track Photopea state
+        let photopeaReady = false;
+        let fileLoaded = false;
+        let psdData = null;
+
+        // Expose functions that Photopea page can call back to Node.js
+        await page.exposeFunction('__ppReady', () => {
+            console.log('✅ Photopea ready signal received via exposeFunction');
+            photopeaReady = true;
+        });
+
+        await page.exposeFunction('__ppFileLoaded', () => {
+            console.log('✅ File loaded signal received via exposeFunction');
+            fileLoaded = true;
+        });
+
+        await page.exposeFunction('__ppPsdData', (dataArray) => {
+            console.log(`✅ PSD data received: ${dataArray.length} bytes`);
+            psdData = Buffer.from(dataArray);
+        });
+
+        // Navigate to Photopea
+        console.log('🌐 Loading Photopea...');
+        await page.goto('https://www.photopea.com/', {
+            waitUntil: 'networkidle2',
+            timeout: 90000
+        });
+
+        // Set up message listener in page context to forward to our exposed functions
+        console.log('⏳ Setting up message handlers...');
+        await page.evaluate(() => {
+            let readyReceived = false;
+            let fileLoadedReceived = false;
+
+            window.addEventListener('message', async function (e) {
+                if (e.data === 'done') {
+                    if (!readyReceived) {
+                        readyReceived = true;
+                        console.log('Photopea sent initial done');
+                        window.__ppReady();
+                    } else if (!fileLoadedReceived) {
+                        fileLoadedReceived = true;
+                        console.log('Photopea sent file loaded done');
+                        window.__ppFileLoaded();
+                    } else {
+                        console.log('Photopea sent additional done (after export)');
                     }
-                });
-            </script>
-        </body>
-        </html>`;
-
-        // Use data URL to load the wrapper page
-        console.log('🌐 Loading Photopea wrapper page...');
-        await page.goto(`data:text/html,${encodeURIComponent(wrapperHTML)}`, {
-            waitUntil: 'networkidle0',
-            timeout: 60000
+                } else if (e.data instanceof ArrayBuffer) {
+                    console.log('Received ArrayBuffer: ' + e.data.byteLength + ' bytes');
+                    const arr = Array.from(new Uint8Array(e.data));
+                    window.__ppPsdData(arr);
+                } else if (typeof e.data === 'string') {
+                    console.log('Photopea string message: ' + e.data.substring(0, 100));
+                }
+            });
         });
 
-        // Wait for Photopea to be fully loaded and send "done" signal
+        // Wait for Photopea to be ready
         console.log('⏳ Waiting for Photopea to initialize...');
-        await page.waitForFunction(() => window.ppReady === true, {
-            timeout: 60000,
-            polling: 500
-        });
+        await waitFor(() => photopeaReady, 60000, 'Photopea initialization');
         console.log('✅ Photopea is ready');
 
-        // Send the .fig file to Photopea via the iframe's contentWindow
-        console.log('� Sending .fig file to Photopea...');
-
-        // Reset ready flag before sending file
-        await page.evaluate(() => { window.ppReady = false; });
-
+        // Send the .fig file
+        console.log('📤 Sending .fig file to Photopea...');
         await page.evaluate((bufferArray) => {
             const uint8Array = new Uint8Array(bufferArray);
-            const iframe = document.getElementById('pp');
-            iframe.contentWindow.postMessage(uint8Array.buffer, '*');
+            window.postMessage(uint8Array.buffer, '*');
         }, Array.from(fileBuffer));
 
-        // Wait for Photopea to process the file (sends "done" when complete)
-        console.log('⏳ Waiting for file to load in Photopea...');
-        await page.waitForFunction(() => window.ppReady === true, {
-            timeout: 60000,
-            polling: 1000
-        });
+        // Wait for file to be loaded
+        console.log('⏳ Waiting for file to load...');
+        await waitFor(() => fileLoaded, 60000, 'File loading');
         console.log('✅ File loaded in Photopea');
 
-        // Add a small delay for rendering to complete
+        // Small delay for rendering
         await new Promise(r => setTimeout(r, 2000));
-
-        // Reset flags before export
-        await page.evaluate(() => {
-            window.ppReady = false;
-            window.psdData = null;
-        });
 
         // Request PSD export
         console.log('🔄 Requesting PSD export...');
         await page.evaluate(() => {
-            const iframe = document.getElementById('pp');
-            iframe.contentWindow.postMessage('app.activeDocument.saveToOE("psd");', '*');
+            window.postMessage('app.activeDocument.saveToOE("psd");', '*');
         });
 
-        // Wait for PSD data to arrive
+        // Wait for PSD data
         console.log('⏳ Waiting for PSD data...');
-        await page.waitForFunction(() => window.psdData !== null, {
-            timeout: 60000,
-            polling: 500
-        });
-
-        // Retrieve the PSD data
-        const psdArray = await page.evaluate(() => {
-            const data = window.psdData;
-            return Array.from(new Uint8Array(data));
-        });
-
-        console.log('✅ PSD received from Photopea');
-
-        // Convert back to Buffer
-        const psdBufferNode = Buffer.from(psdArray);
+        await waitFor(() => psdData !== null, 60000, 'PSD export');
+        console.log(`✅ PSD received: ${psdData.length} bytes`);
 
         // Send PSD back to client
         res.set({
             'Content-Type': 'application/x-photoshop',
             'Content-Disposition': `attachment; filename="${fileName.replace('.fig', '.psd')}"`,
-            'Content-Length': psdBufferNode.length
+            'Content-Length': psdData.length
         });
 
-        console.log(`✅ Sending PSD (${psdBufferNode.length} bytes) to client`);
-        res.send(psdBufferNode);
+        console.log(`✅ Sending PSD (${psdData.length} bytes) to client`);
+        res.send(psdData);
 
     } catch (error) {
-        console.error('❌ Conversion error:', error);
-
-        // Try to get debug info from the page
-        try {
-            if (browser) {
-                const pages = await browser.pages();
-                if (pages.length > 0) {
-                    const debugInfo = await pages[0].evaluate(() => {
-                        return {
-                            ppReady: window.ppReady,
-                            psdDataSize: window.psdData ? window.psdData.byteLength : null,
-                            messageLog: window.messageLog
-                        };
-                    }).catch(() => null);
-                    console.log('Debug info:', debugInfo);
-                }
-            }
-        } catch (debugError) {
-            // Ignore debug errors
-        }
-
+        console.error('❌ Conversion error:', error.message);
         res.status(500).json({
             error: 'Conversion failed',
             message: error.message
@@ -212,6 +176,22 @@ app.post('/convert', upload.single('file'), async (req, res) => {
         }
     }
 });
+
+// Helper function to wait for a condition
+function waitFor(conditionFn, timeoutMs, description) {
+    return new Promise((resolve, reject) => {
+        const startTime = Date.now();
+        const checkInterval = setInterval(() => {
+            if (conditionFn()) {
+                clearInterval(checkInterval);
+                resolve();
+            } else if (Date.now() - startTime > timeoutMs) {
+                clearInterval(checkInterval);
+                reject(new Error(`Timeout waiting for: ${description}`));
+            }
+        }, 500);
+    });
+}
 
 // Error handling middleware
 app.use((error, req, res, next) => {
