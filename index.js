@@ -75,8 +75,15 @@ app.post('/convert', upload.single('file'), async (req, res) => {
             return typeof window.postMessage !== 'undefined';
         }, { timeout: 10000 });
 
-        // Additional wait for Photopea's internal initialization
-        await page.waitForTimeout(2000);
+        // Listen for console logs from the browser
+        page.on('console', msg => console.log('PAGE LOG:', msg.text()));
+
+        // Check if Photopea is loaded
+        console.log('⏳ Verifying Photopea load...');
+        await page.evaluate(() => {
+            if (!window.app) console.log("window.app is missing!");
+            else console.log("window.app is present");
+        });
 
         // Send the .fig file to Photopea
         console.log('📤 Sending .fig file to Photopea...');
@@ -85,16 +92,27 @@ app.post('/convert', upload.single('file'), async (req, res) => {
             window.postMessage(uint8Array.buffer, '*');
         }, Array.from(fileBuffer));
 
-        // Wait for file to load
+        // Wait for file to load by polling app.documents.length
         console.log('⏳ Waiting for file to load in Photopea...');
-        await page.waitForTimeout(5000);
+        await page.waitForFunction(() => {
+            // Check if app exists and has documents
+            // We use script injection via postMessage usually, but checking state:
+            // Since we are in the same context, let's try to access window.app if available
+            // If Puppeteer is on the page, window.app should be accessible.
+            return window.app && window.app.activeDocument;
+        }, { timeout: 30000, polling: 1000 }).catch(e => {
+            console.log("Wait for document failed, trying to proceed anyway...");
+        });
+
+        // Wait a bit more to be safe for rendering
+        await new Promise(r => setTimeout(r, 2000));
 
         // Request PSD export
         console.log('🔄 Requesting PSD export...');
         const psdBuffer = await page.evaluate(() => {
             return new Promise((resolve, reject) => {
                 const timeout = setTimeout(() => {
-                    reject(new Error('Timeout waiting for PSD export'));
+                    reject(new Error('Timeout waiting for PSD export response (30s)'));
                 }, 30000);
 
                 window.addEventListener('message', function handler(e) {
@@ -104,11 +122,23 @@ app.post('/convert', upload.single('file'), async (req, res) => {
                         // Convert ArrayBuffer to regular array for transfer
                         const uint8Array = new Uint8Array(e.data);
                         resolve(Array.from(uint8Array));
+                    } else if (typeof e.data === 'string' && e.data.startsWith('done')) {
+                        // Some internal Photopea messages
+                        console.log("Photopea message: " + e.data);
                     }
                 });
 
-                // Request PSD export
-                window.postMessage('app.activeDocument.saveToOE("psd");', '*');
+                // Request PSD export - ensure app is ready
+                if (window.app && window.app.activeDocument) {
+                    console.log("Attempting saveToOE via direct JS...");
+                    // If we have direct access, try that first?
+                    // No, Photopea recommends postMessage strings for separation.
+                    // But saveToOE("psd") triggers the ArrayBuffer response.
+                    window.postMessage('app.activeDocument.saveToOE("psd");', '*');
+                } else {
+                    console.log("app.activeDocument not found, trying generic postMessage...");
+                    window.postMessage('app.activeDocument.saveToOE("psd");', '*');
+                }
             });
         });
 
