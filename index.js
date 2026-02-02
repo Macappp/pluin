@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
+app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
 // Configure multer for file uploads (store in memory)
@@ -47,132 +48,102 @@ app.post('/convert', upload.single('file'), async (req, res) => {
     let browser;
     try {
         console.log('🚀 Launching Puppeteer...');
+        // Use standard launch
         browser = await puppeteer.launch({
-            headless: 'new',
+            headless: 'new', // or true
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-web-security',
+                '--disable-web-security', // Needed for cross-origin iframe interaction if we were doing it directly, still good to have
                 '--disable-features=IsolateOrigins,site-per-process'
             ]
         });
 
         const page = await browser.newPage();
-        page.setDefaultTimeout(120000);
 
-        // Enable console logging from the page
+        // Capture browser console logs
         page.on('console', msg => console.log('PAGE:', msg.text()));
 
-        // Variables to track Photopea state (in Node.js scope)
-        let photopeaReady = false;
-        let fileLoaded = false;
-        let psdData = null;
+        // Expose bindings for the wrapper to call
+        let resolverReady;
+        const readyPromise = new Promise(r => resolverReady = r);
 
-        // Expose functions that Photopea page can call back to Node.js
-        await page.exposeFunction('__ppReady', () => {
-            console.log('✅ Photopea ready signal received via exposeFunction');
-            photopeaReady = true;
+        let resolverData;
+        const dataPromise = new Promise(r => resolverData = r);
+
+        await page.exposeFunction('onPhotopeaReady', () => {
+            console.log('✅ Photopea Ready (callback from wrapper)');
+            resolverReady();
         });
 
-        await page.exposeFunction('__ppFileLoaded', () => {
-            console.log('✅ File loaded signal received via exposeFunction');
-            fileLoaded = true;
+        await page.exposeFunction('onPhotopeaData', (data) => {
+            console.log(`✅ Received Data: ${data ? data.length : 0} bytes`);
+            resolverData(data);
         });
 
-        await page.exposeFunction('__ppPsdData', (dataArray) => {
-            console.log(`✅ PSD data received: ${dataArray.length} bytes`);
-            psdData = Buffer.from(dataArray);
-        });
+        // Navigate to our local wrapper
+        // Ensure we are listening before navigating
+        const localUrl = `http://localhost:${PORT}/wrapper.html`;
+        console.log(`🌐 Navigating to ${localUrl}...`);
 
-        // CRITICAL: Attach listeners BEFORE navigation using evaluateOnNewDocument
-        // This ensures we don't miss the initial "done" message
-        await page.evaluateOnNewDocument(() => {
-            let readyReceived = false;
-            let fileSent = false;
+        await page.goto(localUrl, { waitUntil: 'networkidle0' });
 
-            window.addEventListener('message', function (e) {
-                if (e.data === 'done') {
-                    if (!readyReceived) {
-                        readyReceived = true;
-                        console.log('[Browser] Photopea initial done');
-                        window.__ppReady();
-                    } else if (fileSent) {
-                        console.log('[Browser] Photopea script/file processing done');
-                        window.__ppFileLoaded();
-                    }
-                } else if (e.data instanceof ArrayBuffer) {
-                    console.log('[Browser] Received ArrayBuffer: ' + e.data.byteLength);
-                    const arr = Array.from(new Uint8Array(e.data));
-                    window.__ppPsdData(arr);
-                }
-            });
+        // Wait for Photopea 'done' message
+        console.log('⏳ Waiting for Photopea initialization...');
+        await readyPromise;
 
-            // Help track when we've sent a file/script
-            window.markFileSent = () => { fileSent = true; };
-        });
-
-        // Navigate to Photopea
-        console.log('🌐 Loading Photopea...');
-        await page.goto('https://www.photopea.com/', {
-            waitUntil: 'networkidle2',
-            timeout: 90000
-        });
-
-        // Wait for Photopea to be ready
-        console.log('⏳ Waiting for Photopea to initialize (expecting "done")...');
-        await waitFor(() => photopeaReady, 60000, 'Photopea initialization');
-        console.log('✅ Photopea is ready');
-
-        // Send the .fig file
-        console.log('📤 Sending .fig file to Photopea...');
-        await page.evaluate((bufferArray) => {
-            const uint8Array = new Uint8Array(bufferArray);
-            window.markFileSent();
-            window.postMessage(uint8Array.buffer, '*');
+        // Send file
+        console.log('📤 Sending file to Photopea...');
+        // Pass buffer as array (Puppeteer serializes this)
+        await page.evaluate((data) => {
+            window.loadPhotopeaFile(data);
         }, Array.from(fileBuffer));
 
-        // Wait for file to be loaded
-        console.log('⏳ Waiting for Photopea to process file...');
-        await waitFor(() => fileLoaded, 60000, 'File processing');
-        console.log('✅ File loaded in Photopea');
+        // Wait a small amount of time for file processing (Photopea is fast but async)
+        // We don't have a direct 'file loaded' signal from the wrapper yet unless we add one listening to 'opened' 
+        // But usually 'done' is for init. Loading happens fast.
+        // Let's rely on a delay or update wrapper to listen for 'fileOpened' if Photopea sends it?
+        // Photopea sends 'done' only on init. 
+        // It doesn't send a message when a file opens unless we script it.
+        // But we are just sending the buffer.
 
-        // Small delay for rendering safety
-        await new Promise(r => setTimeout(r, 2000));
+        // Let's wait a safe margin
+        await new Promise(r => setTimeout(r, 3000));
 
-        // Request PSD export
-        console.log('🔄 Requesting PSD export...');
+        // Script: save
+        console.log('� Triggering Save...');
         await page.evaluate(() => {
-            window.postMessage('app.activeDocument.saveToOE("psd");', '*');
+            window.savePhotopeaFile('psd');
         });
 
-        // Wait for PSD data
-        console.log('⏳ Waiting for PSD data...');
-        await waitFor(() => psdData !== null, 60000, 'PSD export');
-        console.log(`✅ PSD received: ${psdData.length} bytes`);
+        // Wait for data
+        console.log('⏳ Waiting for PSD data back...');
 
-        // Send PSD back to client
+        // Set a timeout for the data promise
+        const data = await Promise.race([
+            dataPromise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout waiting for PSD data')), 60000))
+        ]);
+
+        if (!data) throw new Error('Received empty data from Photopea');
+
+        const psdBuffer = Buffer.from(data);
+
+        console.log(`✅ Conversion complete. Sending ${psdBuffer.length} bytes to client.`);
+
         res.set({
             'Content-Type': 'application/x-photoshop',
             'Content-Disposition': `attachment; filename="${fileName.replace('.fig', '.psd')}"`,
-            'Content-Length': psdData.length
+            'Content-Length': psdBuffer.length
         });
-
-        console.log(`✅ Sending PSD (${psdData.length} bytes) to client`);
-        res.send(psdData);
+        res.send(psdBuffer);
 
     } catch (error) {
-        console.error('❌ Conversion error:', error.message);
-        res.status(500).json({
-            error: 'Conversion failed',
-            message: error.message
-        });
+        console.error('❌ Conversion error:', error);
+        res.status(500).json({ error: 'Conversion failed', details: error.message });
     } finally {
-        if (browser) {
-            await browser.close();
-            console.log('🔒 Browser closed');
-        }
+        if (browser) await browser.close();
     }
 });
 

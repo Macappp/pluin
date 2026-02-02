@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Photopea Wrapper</title>
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+        iframe { width: 100%; height: 100%; border: none; }
+    </style>
+</head>
+<body>
+    <iframe id="pp" src="https://www.photopea.com"></iframe>
+
+    <script>
+        const pp = document.getElementById('pp').contentWindow;
+        let ready = false;
+
+        // Listen for messages from Photopea
+        window.addEventListener('message', (e) => {
+            // Photopea sends "done" when initialized
+            if (e.data === 'done') {
+                ready = true;
+                console.log('Photopea wrapper: Received done');
+                if (window.onPhotopeaReady) window.onPhotopeaReady();
+            } 
+            // Photopea sends ArrayBuffer when saving with saveToOE
+            else if (e.data instanceof ArrayBuffer) {
+                console.log('Photopea wrapper: Received ArrayBuffer', e.data.byteLength);
+                if (window.onPhotopeaData) {
+                    // Convert to array for Puppeteer transfer if needed, or handle buffer directly
+                    // Puppeteer might prefer standard arrays or base64 if raw buffer transfer is tricky
+                    const uint8 = new Uint8Array(e.data);
+                    window.onPhotopeaData(Array.from(uint8));
+                }
+            }
+        });
+
+        // Function for Puppeteer to call to load a file
+        window.loadPhotopeaFile = (fileBuffer) => {
+            console.log('Photopea wrapper: Sending file to iframe', fileBuffer.byteLength);
+            // fileBuffer comes from Puppeteer, we need to ensure it's an ArrayBuffer
+            // Puppeteer passes arrays as Array, so we might need to convert
+            let bufferToSend = fileBuffer;
+            if (Array.isArray(fileBuffer) || fileBuffer instanceof Array) {
+                bufferToSend = new Uint8Array(fileBuffer).buffer;
+            }
+            pp.postMessage(bufferToSend, '*');
+        };
+
+        // Function to trigger save
+        window.savePhotopeaFile = (format) => {
+            console.log('Photopea wrapper: Requesting save as', format);
+            pp.postMessage(`app.activeDocument.saveToOE("${format}");`, '*');
+        };
+    </script>
+</body>
+</html>
